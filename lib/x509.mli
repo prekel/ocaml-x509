@@ -1005,9 +1005,42 @@ end
 
 (** PKCS12 archive files *)
 module PKCS12 : sig
+  type attribute = [
+    | `FriendlyName of string
+    | `LocalKeyId of Cstruct.t
+  ]
+
+  type safe_bag
+
+  val safe_bag_pp : safe_bag Fmt.t
+
+  val safe_bag_private_key : ?attrs:attribute list ->
+    Private_key.t -> safe_bag
+
+  val safe_bag_pkcs8shrouded_key : ?attrs:attribute list ->
+    ?algo:Algorithm.t -> password:string ->
+    Private_key.t -> (safe_bag, [> R.msg ]) result
+
+  val safe_bag_certificate : ?attrs:attribute list ->
+    Certificate.t -> safe_bag
+
+  val safe_bag_encode_der : safe_bag list -> Cstruct.t
+
+  type content_info
+
+  val content_info_pp : content_info Fmt.t
+
+  val content_info_data : safe_bag list -> content_info
+
+  val content_info_encrypted : ?algo:Algorithm.t -> password:string ->
+    safe_bag list -> (content_info, [> R.msg ]) result
+
+  val content_info_encode_der : content_info list -> Cstruct.t
 
   (** A PKCS12 encoded archive file, *)
   type t
+
+  val pp : t Fmt.t
 
   (** [decode_der buffer] is [t], the PKCS12 archive of [buffer]. *)
   val decode_der : Cstruct.t -> (t, [> R.msg ]) result

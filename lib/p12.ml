@@ -6,13 +6,37 @@
    some definitions from PKCS7 (RFC 2315) are implemented as well, as needed
 *)
 
-type content_info = Asn.oid * Cstruct.t
+type attribute_int = Asn.oid * Cstruct.t list
+
+type attribute = [
+  | `FriendlyName of string
+  | `LocalKeyId of Cstruct.t
+]
+
+let attribute_to_internal : attribute -> attribute_int = function
+  | `FriendlyName x ->
+    Registry.PKCS9.friendly_name, [Cstruct.of_string x]
+  | `LocalKeyId x -> Registry.PKCS9.local_key_id, [x]
+
+type safe_bag = [
+  | `Certificate of Certificate.t
+  | `Crl of Crl.t
+  | `Encrypted_private_key of Algorithm.t * Cstruct.t
+  | `Private_key of Private_key.t
+] * attribute_int list option
+
+type content_info = [
+    | `Data of Cstruct.t
+    | `Encrypted of Algorithm.t * Cstruct.t option
+  ]
 
 type digest_info = Algorithm.t * Cstruct.t
 
 type mac_data = digest_info * Cstruct.t * int
 
 type t = Cstruct.t * mac_data
+
+module Asn_ = Asn
 
 module Asn = struct
   open Asn_grammars
@@ -44,7 +68,7 @@ module Asn = struct
       (required ~label:"version" int)
       (required ~label:"encrypted content info" encrypted_content_info)
 
-  let content_info =
+  let content_info : content_info Asn.t =
     let f (oid, data) =
       match data with
       | None -> parse_error "found no value for content info"
@@ -295,7 +319,7 @@ let pad bs x =
    - PKCS5 v1 (PBES, PBKDF1) -- not (yet?) supported
    - PKCS5 v2 (PBES2, PBKDF2)
 *)
-let pkcs12_decrypt algo password data =
+let pkcs12_enc_dec_common algo password =
   let open Algorithm in
   let open Rresult.R.Infix in
   let hash = `SHA1 in
@@ -310,6 +334,24 @@ let pkcs12_decrypt algo password data =
   let key = pbes hash `Encryption password salt count key_len
   and iv = pbes hash `Iv password salt count iv_len
   in
+  Ok (key, iv, key_len, iv_len)
+
+let pkcs12_encrypt algo password data =
+  let open Rresult.R.Infix in
+  pkcs12_enc_dec_common algo password >>= fun (key, iv, _key_len, _iv_len) ->
+  (* TODO: not sure if k = 8 *)
+  let data = pad 8 data in
+  (match algo with
+   | SHA_3DES_CBC _ ->
+     let open Mirage_crypto.Cipher_block in
+     let key = DES.CBC.of_secret key in
+     Ok (DES.CBC.encrypt ~key ~iv data)
+   | _ -> Error (`Msg "encryption algorithm not supported"))
+
+
+let pkcs12_decrypt algo password data =
+  let open Rresult.R.Infix in
+  pkcs12_enc_dec_common algo password >>= fun (key, iv, key_len, _iv_len) ->
   (match algo with
    | SHA_RC2_40_CBC _ | SHA_RC2_128_CBC _ ->
      Ok (Rc2.decrypt_cbc ~effective:(key_len * 8) ~key ~iv data)
@@ -440,3 +482,113 @@ let create ?(mac = `SHA256) ?(algorithm = `AES256_CBC) ?(iterations = 2048) pass
 let decode_der cs = Asn_grammars.err_to_msg (Asn.pfx_of_cs cs)
 
 let encode_der = Asn.pfx_to_cs
+
+(* Pretty printers *)
+let cstruct_pp fmt data =
+  let open Cstruct in
+  let l = len data in
+  if l > 16 then
+    Fmt.pf fmt "%a ... %a"
+      Cstruct.hexdump_pp (sub data 0 8)
+      Cstruct.hexdump_pp (sub data (l - 5) 5)
+  else
+    Cstruct.hexdump_pp fmt data
+
+let safe_bag_pp fmt = function
+  | `Certificate _cert, _a -> Fmt.pf fmt "Certificate"
+  | `Crl _c, _a -> Fmt.pf fmt "Crl"
+  | `Private_key _p, _ -> Fmt.pf fmt "Private_key"
+  | `Encrypted_private_key (algo, enc_data), _ ->
+    Fmt.pf fmt "Encrypted_private_key@[<v>@ algo=%a@ data=%a@]"
+      Algorithm.pp algo
+      cstruct_pp enc_data
+
+let content_info_pp fmt = function
+  | `Data data ->
+    (match Asn.safe_contents_of_cs data with
+     | Ok bags -> Fmt.pf fmt "Data@[<v>@ %a@]" (Fmt.list safe_bag_pp) bags
+     | Error (`Parse e) -> Fmt.pf fmt "%s" e)
+  | `Encrypted (algo, data) ->
+    Fmt.pf fmt
+      "Encrypted@[<v>@ algo=%a@ data=%a@]"
+      Algorithm.pp algo
+      (Fmt.option cstruct_pp) data
+
+let pp fmt (data, ((algorithm, digest), salt, iterations)) =
+  let open Rresult.R in
+  let content = Asn.auth_safe_of_cs data
+                |> Asn_grammars.err_to_msg |> failwith_error_msg in
+  Fmt.pf fmt
+    "@[<v>MAC params: %a salt=%a iterations=%i@,MAC digest: %a@,%a@,@]"
+    Algorithm.pp algorithm
+    cstruct_pp salt
+    iterations
+    cstruct_pp digest
+    (Fmt.list content_info_pp) content
+
+
+(* Construction functions *)
+let safe_bag_private_key ?attrs priv_key =
+  let attrs = match attrs with
+    | None -> None
+    | Some attrs -> Some (List.map attribute_to_internal attrs)
+  in
+  `Private_key priv_key, attrs
+
+let safe_bag_pkcs8shrouded_key ?attrs ?algo ~password priv_key =
+  let attrs = match attrs with
+    | None -> None
+    | Some attrs -> Some (List.map attribute_to_internal attrs)
+  in
+  let open Rresult.R.Infix in
+  let algo = match algo with
+    | Some x -> x
+    | None ->
+      let salt = Mirage_crypto_rng.generate 8 in
+      Algorithm.SHA_3DES_CBC (salt, 2048)
+  in
+  let priv_key = Private_key.Asn.private_to_cstruct priv_key in
+  pkcs12_encrypt algo password priv_key >>| fun enc_data ->
+  `Encrypted_private_key (algo, enc_data), attrs
+
+let safe_bag_certificate ?attrs cert =
+  let attrs = match attrs with
+    | None -> None
+    | Some attrs -> Some (List.map attribute_to_internal attrs)
+  in
+  `Certificate cert, attrs
+
+let safe_bag_encode_der = Asn.safe_contents_to_cs
+
+let content_info_encrypted ?algo ~password data =
+  let open Rresult.R.Infix in
+  let algo = match algo with
+    | Some x -> x
+    | None ->
+      let salt = Mirage_crypto_rng.generate 8 in
+      Algorithm.SHA_3DES_CBC (salt, 2048)
+  in
+  let data = safe_bag_encode_der data in
+  (* TODO: check type *)
+  pkcs12_encrypt algo password data >>| fun enc_data ->
+  `Encrypted (algo, Some enc_data)
+
+let content_info_data data =
+  let data = safe_bag_encode_der data in
+  `Data data
+
+let content_info_encode_der = Asn.auth_safe_to_cs
+
+
+(* let create ?(hash=`SHA1) ?(iterations=2048) ?salt
+ *     ~password auth_safe =
+ *   let salt = match salt with
+ *     | None -> Mirage_crypto_rng.generate 8
+ *     | Some x -> x
+ *   in
+ *   let auth_safe = Asn.auth_safe_to_cs auth_safe in
+ *   let key = pbes hash `Hmac password salt iterations
+ *       (Mirage_crypto.Hash.digest_size hash) in
+ *   let digest = Mirage_crypto.Hash.mac `SHA1 ~key auth_safe in
+ *   let hash_algo = Algorithm.of_hash hash in
+ *   (auth_safe, ((hash_algo, digest), salt, iterations)) *)

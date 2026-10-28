@@ -1,0 +1,37 @@
+--- a/lib/p12.ml
++++ b/lib/p12.ml
+@@ -432,10 +432,11 @@
+   end else
+     Error (`Msg "invalid signature")
+ 
+-let create ?(mac = `SHA256) ?(algorithm = `AES256_CBC) ?(iterations = 2048) password certificates private_key =
++let create ?(mac = `SHA256) ?(algorithm = `AES256_CBC) ?(iterations = 2048) ?local_key_id password certificates private_key =
+   let key_fp pub = Public_key.fingerprint pub in
+   let priv_fp = key_fp (Private_key.public private_key) in
+-  let attributes = [ Registry.PKCS9.local_key_id, [ priv_fp ]] in
++  let local_key_id = Option.value ~default:priv_fp local_key_id in
++  let attributes = [ Registry.PKCS9.local_key_id, [ local_key_id ]] in
+   let maybe_attr c =
+     if String.equal priv_fp (key_fp (Certificate.public_key c)) then
+       Some attributes
+--- a/lib/x509.mli
++++ b/lib/x509.mli
+@@ -1231,14 +1231,16 @@
+      | `Private_key of Private_key.t | `Decrypted_private_key of Private_key.t ]
+        list, [> `Msg of string ]) result
+ 
+-  (** [create ~mac ~algorithm ~iterations password certificates private_key]
++  (** [create ~mac ~algorithm ~iterations ?local_key_id password certificates private_key]
+       constructs a PKCS12 archive with [certificates] and [private_key]. They
+       are encrypted with [algorithm] (using PBES2, PKCS5v2) and integrity
+       protected using [mac]. A [local key id] is always embedded in the private
+-      key and matching certificate. *)
++      key and matching certificate. If [local_key_id] is provided, its raw bytes
++      are used; otherwise the public key fingerprint is used. *)
+   val create : ?mac:[`SHA1 | `SHA224 | `SHA256 | `SHA384 | `SHA512 ] ->
+     ?algorithm:[ `AES128_CBC | `AES192_CBC | `AES256_CBC ] ->
+     ?iterations:int ->
++    ?local_key_id:string ->
+     string -> Certificate.t list -> Private_key.t ->
+     t
+ end

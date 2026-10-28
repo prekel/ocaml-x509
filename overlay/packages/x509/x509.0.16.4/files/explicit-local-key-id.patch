@@ -1,0 +1,60 @@
+diff --git a/lib/p12.ml b/lib/p12.ml
+index 02e2085..3a15cf9 100644
+--- a/lib/p12.ml
++++ b/lib/p12.ml
+@@ -431,13 +431,20 @@ let verify password (data, ((algorithm, digest), salt, iterations)) =
+   end else
+     Error (`Msg "invalid signature")
+ 
+-let create ?(mac = `SHA256) ?(algorithm = `AES256_CBC) ?(iterations = 2048) password certificates private_key =
++let create ?(mac = `SHA256) ?(algorithm = `AES256_CBC) ?(iterations = 2048) ?local_key_id password certificates private_key =
++  let attributes = match local_key_id with
++    | None -> None
++    | Some local_key_id ->
++      Some [
++        Registry.PKCS9.local_key_id, [local_key_id]
++      ]
++  in
+   let cert_sc =
+-    Asn.safe_contents_to_cs (List.map (fun c -> `Certificate c, None) certificates)
++    Asn.safe_contents_to_cs (List.map (fun c -> `Certificate c, attributes) certificates)
+   and priv_sc =
+     let data = Private_key.Asn.private_to_cstruct private_key in
+     let algo, data = pkcs5_2_encrypt mac iterations algorithm password data in
+-    Asn.safe_contents_to_cs [ `Encrypted_private_key (algo, data), None ]
++    Asn.safe_contents_to_cs [ `Encrypted_private_key (algo, data), attributes ]
+   in
+   let cert_sc_enc =
+     let algo, data = pkcs5_2_encrypt mac iterations algorithm password cert_sc in
+diff --git a/lib/registry.ml b/lib/registry.ml
+index 707f233..3bc8e98 100644
+--- a/lib/registry.ml
++++ b/lib/registry.ml
+@@ -147,6 +147,7 @@ module PKCS9 = struct
+   and smime_capabilities   = pkcs9 <| 15
+   and smime_oid_registry   = pkcs9 <| 16
+   and friendly_name        = pkcs9 <| 20
++  and local_key_id         = pkcs9 <| 21
+   and cert_types           = pkcs9 <| 22
+   and crl_types            = pkcs9 <| 23
+ end
+diff --git a/lib/x509.mli b/lib/x509.mli
+index e35cdf9..3634882 100644
+--- a/lib/x509.mli
++++ b/lib/x509.mli
+@@ -1057,13 +1057,14 @@ module PKCS12 : sig
+      | `Private_key of Private_key.t | `Decrypted_private_key of Private_key.t ]
+        list, [> `Msg of string ]) result
+ 
+-  (** [create ~mac ~algorithm ~iterations password certificates private_key]
++  (** [create ~mac ~algorithm ~iterations ~local_key_id password certificates private_key]
+       constructs a PKCS12 archive with [certificates] and [private_key]. They
+       are encrypted with [algorithm] (using PBES2, PKCS5v2) and integrity
+       protected using [mac]. *)
+   val create : ?mac:[`SHA1 | `SHA224 | `SHA256 | `SHA384 | `SHA512 ] ->
+     ?algorithm:[ `AES128_CBC | `AES192_CBC | `AES256_CBC ] ->
+     ?iterations:int ->
++    ?local_key_id:Cstruct.t ->
+     string -> Certificate.t list -> Private_key.t ->
+     t
+ end
